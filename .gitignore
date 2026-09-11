@@ -1,3 +1,7 @@
 dist/
 node_modules/
 .clangd
+
+# Vitest output: coverage reports, and the artifact directory v5 writes
+coverage/
+.vitest/

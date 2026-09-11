@@ -7,15 +7,16 @@ updates:
     open-pull-requests-limit: 10
     allow:
       - dependency-type: direct
-    ignore:
-      - dependency-name: "*"
-        update-types: ["version-update:semver-patch"]
     commit-message:
       prefix: "chore(deps): "
     cooldown:
       default-days: 7
     groups:
       openmeteo:
+        patterns:
+          - "*"
+      openmeteo-security:
+        applies-to: security-updates
         patterns:
           - "*"
 
