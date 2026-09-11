@@ -1,5 +1,5 @@
 import { BlockCache } from "../BlockCache";
-import { throwIfAborted } from "../utils";
+import { isAbortError, throwIfAborted } from "../utils";
 import { OmFileReaderBackend } from "./OmFileReaderBackend";
 
 /**
@@ -92,6 +92,32 @@ export class BlockCacheBackend<K> implements OmFileReaderBackend {
     return this.cachedCount;
   }
 
+  /**
+   * Reads one block through the cache.
+   *
+   * The cache deduplicates concurrent fetches of the same block, so the fetch
+   * runs under the signal of whichever reader asked for it first. A reader
+   * that is still interested must not inherit that reader's cancellation —
+   * two variables read from the same file share the index blocks, so one of
+   * them being abandoned would otherwise fail the other. The block is simply
+   * fetched again in that case; the aborted entry has been dropped from the
+   * cache by then, so this issues a fresh request under our own signal.
+   */
+  private async getBlock(blockIdxFromEnd: number, fileSize: number, signal?: AbortSignal): Promise<Uint8Array> {
+    const { start, end } = this.getBlockRange(blockIdxFromEnd, fileSize);
+    const key = this.getBlockKey(blockIdxFromEnd);
+    const fetchBlock = () => this.cache.get(key, () => this.backend.getBytes(start, end - start, signal), fileSize);
+
+    try {
+      return await fetchBlock();
+    } catch (error) {
+      // Ours was cancelled too: that abort is the caller's own
+      throwIfAborted(signal);
+      if (!isAbortError(error)) throw error;
+      return await fetchBlock();
+    }
+  }
+
   async getBytes(offset: number, size: number, signal?: AbortSignal): Promise<Uint8Array> {
     throwIfAborted(signal);
     const fileSize = await this.count(signal);
@@ -101,12 +127,8 @@ export class BlockCacheBackend<K> implements OmFileReaderBackend {
 
     // Single block fast path
     if (startBlockFromEnd === endBlockFromEnd) {
-      const { start: blockStart, end: blockEnd } = this.getBlockRange(startBlockFromEnd, fileSize);
-      const block = await this.cache.get(
-        this.getBlockKey(startBlockFromEnd),
-        () => this.backend.getBytes(blockStart, blockEnd - blockStart, signal),
-        fileSize
-      );
+      const { start: blockStart } = this.getBlockRange(startBlockFromEnd, fileSize);
+      const block = await this.getBlock(startBlockFromEnd, fileSize, signal);
       const blockOffset = offset - blockStart;
       return block.subarray(blockOffset, blockOffset + size);
     }
@@ -119,18 +141,12 @@ export class BlockCacheBackend<K> implements OmFileReaderBackend {
       const { start: blockStart, end: blockEnd } = this.getBlockRange(blockIdxFromEnd, fileSize);
 
       promises.push(
-        this.cache
-          .get(
-            this.getBlockKey(blockIdxFromEnd),
-            () => this.backend.getBytes(blockStart, blockEnd - blockStart, signal),
-            fileSize
-          )
-          .then((block) => {
-            const srcStart = Math.max(offset, blockStart) - blockStart;
-            const dstStart = Math.max(blockStart, offset) - offset;
-            const len = Math.min(blockEnd - blockStart - srcStart, size - dstStart);
-            output.set(block.subarray(srcStart, srcStart + len), dstStart);
-          })
+        this.getBlock(blockIdxFromEnd, fileSize, signal).then((block) => {
+          const srcStart = Math.max(offset, blockStart) - blockStart;
+          const dstStart = Math.max(blockStart, offset) - offset;
+          const len = Math.min(blockEnd - blockStart - srcStart, size - dstStart);
+          output.set(block.subarray(srcStart, srcStart + len), dstStart);
+        })
       );
     }
 

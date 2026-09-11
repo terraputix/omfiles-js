@@ -10,7 +10,14 @@ export interface BlockCache<K = bigint> {
   /** Returns the block size used by the cache. */
   blockSize(): number;
 
-  /** Retrieves a block from the cache or fetches it using the provided function. */
+  /**
+   * Retrieves a block from the cache or fetches it using the provided function.
+   *
+   * Implementations that deduplicate concurrent fetches must drop the shared
+   * entry before the callers awaiting it resume: a fetch runs under the signal
+   * of whoever asked first, and a caller that is still interested has to be
+   * able to re-issue one that was cancelled on it.
+   */
   get(key: K, fetchFn: () => Promise<Uint8Array>, fileSize?: number): Promise<Uint8Array>;
 
   /** Retrieves the total size of the cached file corresponding to key, if cached */
@@ -58,6 +65,15 @@ export class LruBlockCache implements BlockCache {
     if (!pending) {
       pending = fetchFn();
       this.inflight.set(key, pending);
+
+      // Attached before anything else, so the entry is gone by the time the
+      // callers waiting on it resume: one reacting to a cancelled fetch must
+      // be able to start a fresh one instead of joining the dead entry again.
+      const forget = () => {
+        this.inflight.delete(key);
+      };
+      void pending.then(forget, forget);
+
       void pending
         .then((data) => {
           // Evict if needed
@@ -67,7 +83,11 @@ export class LruBlockCache implements BlockCache {
           }
           this.cache.set(key, data);
         })
-        .finally(() => this.inflight.delete(key));
+        .catch(() => {
+          // The caller awaiting the returned promise reports the failure; this
+          // chain only fills the cache. Without the catch, every cancelled
+          // block fetch would surface as an unhandled rejection.
+        });
     }
     return pending;
   }

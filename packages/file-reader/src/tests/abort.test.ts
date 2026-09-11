@@ -7,6 +7,9 @@ import { FileBackendNode } from "../lib/backends/FileBackendNode";
 import { OmFileReaderBackend } from "../lib/backends/OmFileReaderBackend";
 import { runLimited } from "../lib/utils";
 
+/** Let every queued microtask run before asserting on scheduling. */
+const flushMicrotasks = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
 // ---------------------------------------------------------------------------
 // A backend wrapper that counts getBytes calls and aborts a controller after
 // a configurable number of calls.  This lets us test mid-read cancellation.
@@ -93,24 +96,55 @@ describe("runLimited with AbortSignal", () => {
     expect(task).not.toHaveBeenCalled();
   });
 
-  it("should stop between batches when signal is aborted mid-run", async () => {
+  it("should stop dispatching further tasks when the signal is aborted mid-run", async () => {
     const controller = new AbortController();
-    let batchesExecuted = 0;
+    let executed = 0;
 
-    const makeBatchTask = (batchIndex: number) => () => {
-      batchesExecuted++;
-      if (batchIndex === 0) {
+    const makeTask = (abortWhenRun: boolean) => () => {
+      executed++;
+      if (abortWhenRun) {
         controller.abort();
       }
-      return Promise.resolve(batchIndex);
+      return Promise.resolve(executed);
     };
 
-    // 4 tasks, limit 2 → 2 batches. Abort after batch 0.
-    const tasks = [makeBatchTask(0), makeBatchTask(0), makeBatchTask(1), makeBatchTask(1)];
+    // 4 tasks, limit 2. The first one aborts as it runs.
+    const tasks = [makeTask(true), makeTask(false), makeTask(false), makeTask(false)];
 
     await expect(runLimited(tasks, 2, controller.signal)).rejects.toThrow();
-    // Only the first batch (2 tasks) should have run
-    expect(batchesExecuted).toBe(2);
+    // The signal is checked before every task, not once per batch, so nothing
+    // is dispatched after the abort
+    expect(executed).toBe(1);
+  });
+
+  it("should keep every slot busy instead of waiting for a batch to finish", async () => {
+    const started: number[] = [];
+    const resolvers: ((value: number) => void)[] = [];
+    const tasks = [0, 1, 2, 3].map(
+      (index) => () =>
+        new Promise<number>((resolve) => {
+          started.push(index);
+          resolvers[index] = resolve;
+        })
+    );
+
+    const run = runLimited(tasks, 2);
+
+    await flushMicrotasks();
+    expect(started).toEqual([0, 1]);
+
+    // Finishing one task must start the next one, rather than waiting for its
+    // neighbour to finish the batch first
+    resolvers[0](0);
+    await flushMicrotasks();
+    expect(started).toEqual([0, 1, 2]);
+
+    resolvers[1](1);
+    resolvers[2](2);
+    await flushMicrotasks();
+    resolvers[3](3);
+
+    await expect(run).resolves.toEqual([0, 1, 2, 3]);
   });
 });
 
